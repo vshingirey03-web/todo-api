@@ -3,10 +3,14 @@ const express = require("express");
 const { DatabaseSync } = require("node:sqlite");
 
 const app = express();
-const PORT = 3000;
+
+// Настройки берём из файла .env (запуск: npm start)
+const PORT = process.env.PORT || 3000;
+const DB_FILE = process.env.DB_FILE || "tasks.db";
+const MAX_TASK_LENGTH = Number(process.env.MAX_TASK_LENGTH) || 200;
 
 // Открываем (или создаём) файл базы данных рядом с сервером
-const db = new DatabaseSync(path.join(__dirname, "tasks.db"));
+const db = new DatabaseSync(path.join(__dirname, DB_FILE));
 
 // Создаём таблицу, если её ещё нет
 db.exec(`
@@ -41,8 +45,20 @@ app.get("/tasks", (req, res) => {
 
 // Добавить задачу
 app.post("/tasks", (req, res) => {
-  const result = db.prepare("INSERT INTO tasks (text) VALUES (?)").run(req.body.text);
-  res.status(201).json({ id: Number(result.lastInsertRowid), text: req.body.text });
+  const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
+
+  // Проверка входных данных: пустой текст не принимаем
+  if (text.length === 0) {
+    return res.status(400).json({ error: "Текст задачи не может быть пустым" });
+  }
+
+  // ...и слишком длинный тоже
+  if (text.length > MAX_TASK_LENGTH) {
+    return res.status(400).json({ error: "Слишком длинный текст (максимум " + MAX_TASK_LENGTH + " символов)" });
+  }
+
+  const result = db.prepare("INSERT INTO tasks (text) VALUES (?)").run(text);
+  res.status(201).json({ id: Number(result.lastInsertRowid), text: text });
 });
 
 // Удалить задачу

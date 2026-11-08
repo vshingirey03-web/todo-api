@@ -26,6 +26,13 @@ const columns = db.prepare("PRAGMA table_info(tasks)").all().map((c) => c.name);
 if (!columns.includes("user_id")) {
   db.exec("ALTER TABLE tasks ADD COLUMN user_id INTEGER");
 }
+// Миграция: отметка "выполнено" и ссылка на родительскую задачу (для подпунктов)
+if (!columns.includes("done")) {
+  db.exec("ALTER TABLE tasks ADD COLUMN done INTEGER NOT NULL DEFAULT 0");
+}
+if (!columns.includes("parent_id")) {
+  db.exec("ALTER TABLE tasks ADD COLUMN parent_id INTEGER");
+}
 
 // Таблицы пользователей и сессий (токенов входа)
 db.exec(`
@@ -57,7 +64,7 @@ app.use(express.json());
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, DELETE");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   next();
 });
@@ -112,33 +119,101 @@ function auth(req, res, next) {
   next();
 }
 
-// Получить задачи текущего пользователя
-app.get("/tasks", auth, (req, res) => {
-  const tasks = db.prepare("SELECT id, text FROM tasks WHERE user_id = ?").all(req.userId);
-  res.json(tasks);
-});
-
-// Добавить задачу
-app.post("/tasks", auth, (req, res) => {
-  const text = typeof req.body.text === "string" ? req.body.text.trim() : "";
-
-  // Проверка входных данных: пустой текст не принимаем
+// Проверка текста задачи (одна и та же при добавлении и редактировании)
+function checkText(text) {
   if (text.length === 0) {
-    return res.status(400).json({ error: "Текст задачи не может быть пустым" });
+    return "Текст задачи не может быть пустым";
   }
-
-  // ...и слишком длинный тоже
   if (text.length > MAX_TASK_LENGTH) {
-    return res.status(400).json({ error: "Слишком длинный текст (максимум " + MAX_TASK_LENGTH + " символов)" });
+    return "Слишком длинный текст (максимум " + MAX_TASK_LENGTH + " символов)";
   }
+  return null;
+}
 
-  const result = db.prepare("INSERT INTO tasks (text, user_id) VALUES (?, ?)").run(text, req.userId);
-  res.status(201).json({ id: Number(result.lastInsertRowid), text: text });
+// Превращаем строку из базы в объект для клиента (done: 0/1 -> false/true)
+function toTask(row) {
+  return { id: row.id, text: row.text, done: row.done === 1, parent_id: row.parent_id };
+}
+
+// Получить задачи текущего пользователя (подпункты ссылаются на родителя через parent_id)
+app.get("/tasks", auth, (req, res) => {
+  const rows = db
+    .prepare("SELECT id, text, done, parent_id FROM tasks WHERE user_id = ? ORDER BY id")
+    .all(req.userId);
+  res.json(rows.map(toTask));
 });
 
-// Удалить свою задачу (чужую удалить нельзя)
+// Добавить задачу или подпункт (если передан parent_id)
+app.post("/tasks", auth, (req, res) => {
+  const body = req.body || {};
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+
+  const error = checkText(text);
+  if (error) {
+    return res.status(400).json({ error: error });
+  }
+
+  let parentId = null;
+  if (body.parent_id !== undefined && body.parent_id !== null) {
+    parentId = Number(body.parent_id);
+    if (!Number.isInteger(parentId)) {
+      return res.status(400).json({ error: "Неверный parent_id" });
+    }
+    const parent = db
+      .prepare("SELECT id, parent_id FROM tasks WHERE id = ? AND user_id = ?")
+      .get(parentId, req.userId);
+    if (!parent) {
+      return res.status(404).json({ error: "Родительская задача не найдена" });
+    }
+    if (parent.parent_id !== null) {
+      return res.status(400).json({ error: "Подпункт нельзя вложить в подпункт" });
+    }
+  }
+
+  const result = db
+    .prepare("INSERT INTO tasks (text, user_id, parent_id) VALUES (?, ?, ?)")
+    .run(text, req.userId, parentId);
+  res.status(201).json({ id: Number(result.lastInsertRowid), text: text, done: false, parent_id: parentId });
+});
+
+// Изменить свою задачу: текст и/или отметку "выполнено"
+app.patch("/tasks/:id", auth, (req, res) => {
+  const id = Number(req.params.id);
+  const body = req.body || {};
+
+  const task = db.prepare("SELECT id FROM tasks WHERE id = ? AND user_id = ?").get(id, req.userId);
+  if (!task) {
+    return res.status(404).json({ error: "Задача не найдена" });
+  }
+
+  // Сначала проверяем всё, потом меняем (чтобы не применить половину изменений)
+  let newText = null;
+  if (body.text !== undefined) {
+    newText = typeof body.text === "string" ? body.text.trim() : "";
+    const error = checkText(newText);
+    if (error) {
+      return res.status(400).json({ error: error });
+    }
+  }
+  if (body.done !== undefined && typeof body.done !== "boolean") {
+    return res.status(400).json({ error: "Поле done должно быть true или false" });
+  }
+
+  if (newText !== null) {
+    db.prepare("UPDATE tasks SET text = ? WHERE id = ?").run(newText, id);
+  }
+  if (body.done !== undefined) {
+    db.prepare("UPDATE tasks SET done = ? WHERE id = ?").run(body.done ? 1 : 0, id);
+  }
+
+  const row = db.prepare("SELECT id, text, done, parent_id FROM tasks WHERE id = ?").get(id);
+  res.json(toTask(row));
+});
+
+// Удалить свою задачу вместе с её подпунктами (чужую удалить нельзя)
 app.delete("/tasks/:id", auth, (req, res) => {
-  db.prepare("DELETE FROM tasks WHERE id = ? AND user_id = ?").run(Number(req.params.id), req.userId);
+  const id = Number(req.params.id);
+  db.prepare("DELETE FROM tasks WHERE (id = ? OR parent_id = ?) AND user_id = ?").run(id, id, req.userId);
   res.status(204).end();
 });
 

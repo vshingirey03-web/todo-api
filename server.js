@@ -119,6 +119,12 @@ function auth(req, res, next) {
   next();
 }
 
+// Кто сейчас вошёл: имя пользователя по токену (показываем на сайте вверху справа)
+app.get("/me", auth, (req, res) => {
+  const user = db.prepare("SELECT username FROM users WHERE id = ?").get(req.userId);
+  res.json({ username: user.username });
+});
+
 // Проверка текста задачи (одна и та же при добавлении и редактировании)
 function checkText(text) {
   if (text.length === 0) {
